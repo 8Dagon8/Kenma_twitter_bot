@@ -14,7 +14,7 @@ BOT_OWNER_ID = int(os.environ.get("BOT_OWNER_ID", "123456789"))
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # OpenAI client (новый способ)
-client = OpenAI(api_key=OPENAI_API_KEY)
+openai.api_key = OPENAI_API_KEY
 model = "gpt-4o"
 
 def get_today_context():
