@@ -9,10 +9,7 @@ BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Tokyo")
 BOT_OWNER_ID = int(os.environ.get("BOT_OWNER_ID", "123456789"))
-print("TELEGRAM_TOKEN:", BOT_TOKEN)
-print("OPENAI_API_KEY:", OPENAI_API_KEY)
-print("TIMEZONE:", TIMEZONE)
-print("BOT_OWNER_ID:", BOT_OWNER_ID)
+
 
 # Telegram бот
 bot = telebot.TeleBot(BOT_TOKEN)
