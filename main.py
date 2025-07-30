@@ -1,21 +1,20 @@
 import os
-import telebot
 import datetime
 import pytz
-from openai import OpenAI
+import telebot
+import openai
 
-# Настройки
+# --- Настройки ---
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Tokyo")
 BOT_OWNER_ID = int(os.environ.get("BOT_OWNER_ID", "123456789"))
 
-# Telegram бот
+# --- Telegram бот ---
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# OpenAI client (новый способ)
+# --- OpenAI настройка ---
 openai.api_key = OPENAI_API_KEY
-model = "gpt-4o"
 
 def get_today_context():
     now = datetime.datetime.now(pytz.timezone(TIMEZONE))
@@ -37,23 +36,22 @@ def generate_post():
         f"{context}\n\n"
         "Write a short tweet in English, then add its Russian translation."
     )
-    response = client.chat.completions.create(
-        model=model,
+
+    response = openai.chat.completions.create(
+        model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.8,
         max_tokens=300,
     )
+
     return response.choices[0].message.content
 
 @bot.message_handler(commands=['post'])
 def send_post(message):
     if message.from_user.id != BOT_OWNER_ID:
         return
-    try:
-        text = generate_post()
-        bot.send_message(message.chat.id, text)
-    except Exception as e:
-        bot.send_message(message.chat.id, f"⚠️ Ошибка генерации: {e}")
+    text = generate_post()
+    bot.send_message(message.chat.id, text)
 
 @bot.message_handler(commands=['start'])
 def welcome(message):
@@ -61,6 +59,7 @@ def welcome(message):
 
 print("🤖 Bot is running...")
 bot.infinity_polling()
+
 
 
 
