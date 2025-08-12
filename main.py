@@ -1,7 +1,9 @@
 import os
+import re
 import json
 import datetime
 import threading
+import logging
 from typing import List
 
 import pytz
@@ -34,6 +36,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 MODEL = "gpt-4o-mini"
 
 # ==== Telegram & Flask ====
+telebot.logger.setLevel(logging.INFO)
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 app = Flask(__name__)
 
@@ -105,6 +108,12 @@ def get_today_context() -> str:
     }[now.strftime('%m')]
     return f"Today is {weekday}, {date}. It’s {season} in Tokyo."
 
+def _clean_code_fences(s: str) -> str:
+    # срезаем ```json ... ``` или ``` ... ```
+    s = re.sub(r"^\s*```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*```\s*$", "", s)
+    return s.strip()
+
 def generate_posts(n: int = DEFAULT_VARIANTS) -> List[str]:
     history = load_history()
     context = get_today_context()
@@ -119,7 +128,7 @@ def generate_posts(n: int = DEFAULT_VARIANTS) -> List[str]:
         "No emojis. No hashtags.\n\n"
         "Avoid repeating the wording/ideas of previous posts below:\n"
         f"{previous}\n\n"
-        f"Return ONLY a valid JSON array of exactly {n} strings."
+        f"Return ONLY a valid JSON array of exactly {n} strings with no extra text, no code fences."
     )
 
     resp = client.chat.completions.create(
@@ -129,15 +138,40 @@ def generate_posts(n: int = DEFAULT_VARIANTS) -> List[str]:
         max_tokens=600,
     )
     raw = resp.choices[0].message.content.strip()
+    cleaned = _clean_code_fences(raw)
 
-    # Парсим как JSON; если не вышло — fallback по абзацам
+    options = None
+    # 1) прямой JSON
     try:
-        options = json.loads(raw)
-        if not isinstance(options, list):
-            raise ValueError
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, list):
+            options = parsed
     except Exception:
-        options = [s.strip() for s in raw.split("\n\n") if s.strip()]
+        pass
 
+    # 2) вырезаем первый массив [ ... ]
+    if options is None:
+        try:
+            start = cleaned.find("[")
+            end = cleaned.rfind("]")
+            if start != -1 and end != -1 and end > start:
+                options = json.loads(cleaned[start:end+1])
+        except Exception:
+            options = None
+
+    # 3) fallback — по абзацам
+    if options is None:
+        options = [s.strip() for s in cleaned.split("\n\n") if s.strip()]
+
+    # 4) если массив внутри одной строки
+    if len(options) == 1 and isinstance(options[0], str) and options[0].lstrip().startswith("["):
+        try:
+            inner = _clean_code_fences(options[0])
+            options = json.loads(inner)
+        except Exception:
+            pass
+
+    # фильтр повторов
     normalized_history = {normalize(p) for p in history}
     unique: List[str] = []
     for o in options:
@@ -182,6 +216,7 @@ def welcome(message):
 
 @bot.message_handler(commands=['post', 'posts'])  # алиас /posts
 def post_variants(message):
+    print(">> CMD /post received:", message.text, flush=True)  # лог в Railway
     try:
         parts = message.text.split()
         n = int(parts[1]) if len(parts) > 1 else DEFAULT_VARIANTS
@@ -206,9 +241,18 @@ def post_variants(message):
 
             PENDING_OPTIONS[user_id] = options
             body = "Варианты:\n\n" + "\n\n".join(f"{i+1}) {opt}" for i, opt in enumerate(options))
+
+            # Кнопки рядами по 3
             kb = InlineKeyboardMarkup()
-            kb.row(*[InlineKeyboardButton(str(i+1), callback_data=f"pick:{i}") for i in range(len(options))])
+            row = []
+            for i in range(len(options)):
+                row.append(InlineKeyboardButton(str(i+1), callback_data=f"pick:{i}"))
+                if len(row) == 3:
+                    kb.row(*row); row = []
+            if row:
+                kb.row(*row)
             kb.add(InlineKeyboardButton("Отменить", callback_data="pick:cancel"))
+
             bot.send_message(chat_id, body, reply_markup=kb)
         except Exception as e:
             bot.send_message(chat_id, f"Ошибка генерации: {e}")
@@ -354,13 +398,9 @@ def export_history(message):
     with open(path, "rb") as f:
         bot.send_document(message.chat.id, f, caption="Экспорт истории")
 
-# ==== Обычный текст (игнорим команды) ====
-@bot.message_handler(func=lambda m: True, content_types=['text'])
+# ==== Обычный текст (важно: НЕ перехватывать команды) ====
+@bot.message_handler(content_types=['text'], func=lambda m: not ((m.text or "").startswith("/")))
 def on_text(message):
-    # важный фикс: не перехватывать команды
-    if (message.text or "").startswith("/"):
-        return
-
     chat_id = message.chat.id
     user_text = message.text or ""
 
@@ -397,6 +437,7 @@ print("Webhook set:", ok, f"{WEBHOOK_URL}/{BOT_TOKEN}", flush=True)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
+
 
 
 
