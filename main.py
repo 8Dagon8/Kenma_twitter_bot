@@ -28,7 +28,7 @@ if not WEBHOOK_URL:
     if not WEBHOOK_URL:
         raise RuntimeError("Missing WEBHOOK_URL (или RAILWAY_PUBLIC_DOMAIN)")
 
-# ==== OpenAI ====
+# ==== OpenAI (SDK 1.x) ====
 from openai import OpenAI
 client = OpenAI(api_key=OPENAI_API_KEY)
 MODEL = "gpt-4o-mini"
@@ -37,13 +37,14 @@ MODEL = "gpt-4o-mini"
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 app = Flask(__name__)
 
-# ==== История ====
+# ==== История и буферы ====
 HISTORY_PATH = "history.json"
-TOKEN_LIMIT = 1000
+TOKEN_LIMIT = 1000                   # ~1000 токенов (≈4 символа на токен)
 DEFAULT_VARIANTS = 3
-PENDING_OPTIONS: dict[int, List[str]] = {}
+PENDING_OPTIONS: dict[int, List[str]] = {}   # {user_id: [варианты]}
+LAST_FILE_BY_USER: dict[int, str] = {}       # {user_id: сырой текст из последнего .txt}
 
-
+# ---------- helpers: history ----------
 def load_history() -> List[str]:
     try:
         with open(HISTORY_PATH, "r", encoding="utf-8") as f:
@@ -53,7 +54,6 @@ def load_history() -> List[str]:
         return []
     except Exception:
         return []
-
 
 def save_history(history: List[str]):
     total_chars = 0
@@ -67,10 +67,8 @@ def save_history(history: List[str]):
     with open(HISTORY_PATH, "w", encoding="utf-8") as f:
         json.dump(trimmed, f, ensure_ascii=False, indent=2)
 
-
 def normalize(s: str) -> str:
     return " ".join((s or "").lower().strip().split())
-
 
 def add_to_history(posts: list[str]) -> int:
     history = load_history()
@@ -80,21 +78,21 @@ def add_to_history(posts: list[str]) -> int:
         p = (p or "").strip()
         if not p:
             continue
-        if normalize(p) in seen:
+        key = normalize(p)
+        if key in seen:
             continue
         history.append(p)
-        seen.add(normalize(p))
+        seen.add(key)
         added += 1
     save_history(history)
     return added
 
-
 def parse_posts_from_text(text: str) -> list[str]:
+    # каждый пост — абзац, отделённый пустой строкой
     chunks = [c.strip() for c in (text or "").split("\n\n") if c.strip()]
     return [c for c in chunks if len(c) >= 10]
 
-
-# ==== Генерация ====
+# ---------- helpers: generation ----------
 def get_today_context() -> str:
     now = datetime.datetime.now(pytz.timezone(TIMEZONE))
     weekday = now.strftime('%A')
@@ -106,7 +104,6 @@ def get_today_context() -> str:
         '10': 'autumn', '11': 'autumn', '12': 'winter',
     }[now.strftime('%m')]
     return f"Today is {weekday}, {date}. It’s {season} in Tokyo."
-
 
 def generate_posts(n: int = DEFAULT_VARIANTS) -> List[str]:
     history = load_history()
@@ -133,6 +130,7 @@ def generate_posts(n: int = DEFAULT_VARIANTS) -> List[str]:
     )
     raw = resp.choices[0].message.content.strip()
 
+    # Парсим как JSON; если не вышло — fallback по абзацам
     try:
         options = json.loads(raw)
         if not isinstance(options, list):
@@ -156,7 +154,6 @@ def generate_posts(n: int = DEFAULT_VARIANTS) -> List[str]:
 
     return unique[:n]
 
-
 def generate_reply_to_text(user_text: str) -> str:
     resp = client.chat.completions.create(
         model=MODEL,
@@ -168,7 +165,6 @@ def generate_reply_to_text(user_text: str) -> str:
         max_tokens=220,
     )
     return resp.choices[0].message.content.strip()
-
 
 # ==== Команды ====
 @bot.message_handler(commands=['start'])
@@ -184,8 +180,7 @@ def welcome(message):
         "• /export_history — экспорт постов"
     )
 
-
-@bot.message_handler(commands=['post'])
+@bot.message_handler(commands=['post', 'posts'])  # алиас /posts
 def post_variants(message):
     try:
         parts = message.text.split()
@@ -220,7 +215,6 @@ def post_variants(message):
 
     threading.Thread(target=worker, daemon=True).start()
 
-
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("pick:"))
 def on_pick(call):
     user_id = call.from_user.id
@@ -230,7 +224,10 @@ def on_pick(call):
     if choice == "cancel":
         PENDING_OPTIONS.pop(user_id, None)
         bot.answer_callback_query(call.id, "Отменено.")
-        bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
+        try:
+            bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
         return
 
     options = PENDING_OPTIONS.get(user_id)
@@ -255,8 +252,10 @@ def on_pick(call):
     history.append(picked)
     save_history(history)
 
-    bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
-
+    try:
+        bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
 
 @bot.message_handler(commands=['history'])
 def show_history(message):
@@ -267,7 +266,6 @@ def show_history(message):
     out = "\n\n".join(f"{i+1}) {p}" for i, p in enumerate(history[-20:]))
     bot.send_message(message.chat.id, "Последние посты:\n\n" + out)
 
-
 @bot.message_handler(commands=['clear_history'])
 def clear_history(message):
     if BOT_OWNER_ID and BOT_OWNER_ID != 0 and message.from_user.id != BOT_OWNER_ID:
@@ -276,48 +274,69 @@ def clear_history(message):
     save_history([])
     bot.send_message(message.chat.id, "История очищена.")
 
-
 @bot.message_handler(commands=['import_history'])
 def import_history_cmd(message):
     if BOT_OWNER_ID and BOT_OWNER_ID != 0 and message.from_user.id != BOT_OWNER_ID:
         bot.send_message(message.chat.id, "⛔️ Not allowed.")
         return
 
-    text_after = message.text.split(" ", 1)[1] if " " in message.text else ""
+    # разбиваем по ЛЮБОМУ пробелу/переносу
+    parts = message.text.split(None, 1)
+    text_after = parts[1] if len(parts) > 1 else ""
+
     replied_text = ""
     if message.reply_to_message and (message.reply_to_message.text or message.reply_to_message.caption):
         replied_text = message.reply_to_message.text or message.reply_to_message.caption
 
-    source_text = text_after.strip() or replied_text.strip()
+    source_text = (text_after or replied_text).strip()
+
+    # если текста нет — попробуем последний файл от этого юзера
+    if not source_text:
+        pending = LAST_FILE_BY_USER.pop(message.from_user.id, None)
+        if pending:
+            posts = parse_posts_from_text(pending)
+            added = add_to_history(posts)
+            bot.send_message(message.chat.id, f"Импортировано из последнего файла: {added} пост(ов).")
+            return
+
     if source_text:
         posts = parse_posts_from_text(source_text)
         added = add_to_history(posts)
         bot.send_message(message.chat.id, f"Импортировано: {added} пост(ов).")
         return
 
-    bot.send_message(message.chat.id, "Пришли .txt с постами (каждый пост отдели пустой строкой) и добавь подпись: /import_history")
-
+    bot.send_message(message.chat.id,
+        "Пришли .txt с постами (каждый пост отдели пустой строкой) и добавь подпись: /import_history\n"
+        "Или пришли текст сразу после команды /import_history."
+    )
 
 @bot.message_handler(content_types=['document'])
 def import_from_file(message):
     if BOT_OWNER_ID and BOT_OWNER_ID != 0 and message.from_user.id != BOT_OWNER_ID:
         return
+
     caption = (message.caption or "").lower()
-    if "/import_history" not in caption:
-        return
+    pass_caption_mode = "/import_history" in caption
+
     if not message.document or not message.document.file_name.lower().endswith(".txt"):
-        bot.send_message(message.chat.id, "Нужен .txt файл с постами. Каждый пост — через пустую строку.")
+        if pass_caption_mode:
+            bot.send_message(message.chat.id, "Нужен .txt файл с постами. Каждый пост — через пустую строку.")
         return
+
     try:
         file_info = bot.get_file(message.document.file_id)
         file_bytes = bot.download_file(file_info.file_path)
         text = file_bytes.decode("utf-8", errors="ignore")
-        posts = parse_posts_from_text(text)
-        added = add_to_history(posts)
-        bot.send_message(message.chat.id, f"Импортировано из файла: {added} пост(ов).")
+
+        if pass_caption_mode:
+            posts = parse_posts_from_text(text)
+            added = add_to_history(posts)
+            bot.send_message(message.chat.id, f"Импортировано из файла: {added} пост(ов).")
+        else:
+            LAST_FILE_BY_USER[message.from_user.id] = text
+            bot.send_message(message.chat.id, "Файл получен. Теперь пришли /import_history (можно просто отдельным сообщением).")
     except Exception as e:
         bot.send_message(message.chat.id, f"Не удалось прочитать файл: {e}")
-
 
 @bot.message_handler(commands=['export_history'])
 def export_history(message):
@@ -335,10 +354,13 @@ def export_history(message):
     with open(path, "rb") as f:
         bot.send_document(message.chat.id, f, caption="Экспорт истории")
 
-
-# ==== Обычный текст ====
+# ==== Обычный текст (игнорим команды) ====
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def on_text(message):
+    # важный фикс: не перехватывать команды
+    if (message.text or "").startswith("/"):
+        return
+
     chat_id = message.chat.id
     user_text = message.text or ""
 
@@ -352,7 +374,6 @@ def on_text(message):
 
     threading.Thread(target=worker, daemon=True).start()
 
-
 # ==== Webhook ====
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def receive_update():
@@ -365,11 +386,9 @@ def receive_update():
         print("!! receive_update error:", e, flush=True)
         return "OK", 200
 
-
 @app.route("/", methods=["GET"])
 def index():
     return "Kenma bot is running."
-
 
 # ==== Установка вебхука ====
 bot.remove_webhook()
@@ -378,6 +397,7 @@ print("Webhook set:", ok, f"{WEBHOOK_URL}/{BOT_TOKEN}", flush=True)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
+
 
 
 
